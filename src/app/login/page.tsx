@@ -7,12 +7,24 @@ export default function LoginPage() {
       <p>Use your VoyageAgent account.</p>
       <form action="/api/auth/login" method="post" style={{ display: 'grid', gap: 16 }}>
         <label>
-          Email
-          <input name="email" type="email" required autoComplete="email" style={{ display: 'block', width: '100%', padding: 10 }} />
+          Username or email
+          <input
+            name="email"
+            type="text"
+            required
+            autoComplete="username"
+            style={{ display: 'block', width: '100%', padding: 10 }}
+          />
         </label>
         <label>
           Password
-          <input name="password" type="password" required autoComplete="current-password" style={{ display: 'block', width: '100%', padding: 10 }} />
+          <input
+            name="password"
+            type="password"
+            required
+            autoComplete="current-password"
+            style={{ display: 'block', width: '100%', padding: 10 }}
+          />
         </label>
         <button type="submit">Sign in</button>
       </form>
