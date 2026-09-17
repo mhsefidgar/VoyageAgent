@@ -1,6 +1,10 @@
 import Link from 'next/link';
 
-export default function LoginPage() {
+export default async function LoginPage({ searchParams }: { searchParams: Promise<{ error?: string; registered?: string }> }) {
+  const params = await searchParams;
+  const error = params.error === 'invalid_credentials';
+  const registered = params.registered === '1';
+
   return (
     <main className="page-shell">
       <div className="container auth-grid">
@@ -19,8 +23,10 @@ export default function LoginPage() {
           <div className="brand"><span className="brand-mark">✈</span> VoyageAgent</div>
           <h1 style={{ marginTop: 28 }}>Welcome back</h1>
           <p className="sub">Sign in to continue your travel workspace.</p>
+          {error && <p role="alert" className="error-message">We couldn’t sign you in. Check your email and password and try again.</p>}
+          {registered && <p role="status" className="success-message">Account created. Check your email if confirmation is required, then sign in.</p>}
           <form action="/api/auth/login" method="post" className="form">
-            <div className="field"><label htmlFor="email">Username or email</label><input id="email" name="email" type="text" required autoComplete="username" placeholder="you@example.com" /></div>
+            <div className="field"><label htmlFor="email">Email</label><input id="email" name="email" type="email" required autoComplete="username" placeholder="you@example.com" /></div>
             <div className="field"><label htmlFor="password">Password</label><input id="password" name="password" type="password" required autoComplete="current-password" placeholder="Enter your password" /></div>
             <button className="button" type="submit">Sign in to VoyageAgent</button>
           </form>
