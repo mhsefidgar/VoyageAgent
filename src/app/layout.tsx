@@ -1,18 +1,11 @@
 import type { Metadata } from 'next';
+import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'VoyageAgent',
-  description: 'Cost-aware AI travel planning for the US and Canada.',
+  title: 'VoyageAgent | Smarter travel planning',
+  description: 'Plan trips, discover stays, and organize your travel with VoyageAgent.',
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
-  return (
-    <html lang="en">
-      <body>{children}</body>
-    </html>
-  );
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  return <html lang="en"><body>{children}</body></html>;
 }
