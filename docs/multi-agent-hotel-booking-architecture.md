@@ -1,73 +1,292 @@
-# VoyageAgent: Multi-Agent Hotel Booking Product Architecture
+# VoyageAgent: Multi-Agent Hotel Booking Architecture
 
-VoyageAgent is a multi-agent hotel booking system. The UI must represent real workflow state, not sample inventory or hardcoded metrics.
+VoyageAgent is a **stateful, multi-agent booking system with a human authorization boundary**. Agents can discover, normalize, rank, and explain inventory; only an approved workflow may cross the booking boundary.
 
-## Agent responsibilities
+The architecture deliberately separates **reasoning from authority**: an LLM can recommend an action, but it cannot grant itself permission to execute that action.
 
-1. **Travel Intake Agent** — converts the user's request into structured constraints: destination, dates, guests, budget, room requirements, amenities, cancellation requirements, and preferences.
-2. **Hotel Search Agent** — queries configured hotel suppliers/APIs and normalizes live offers. It must return provider IDs, offer IDs, price, currency, taxes/fees when available, cancellation policy, room/rate details, and expiry information.
-3. **Hotel Evaluation Agent** — compares normalized offers against the user's constraints. It may explain trade-offs but must not fabricate availability or pricing.
-4. **Booking Agent** — creates a booking only after the approval gate is satisfied. It must persist an idempotency key and provider booking reference.
-5. **Human Approval Agent / Gate** — creates a review task whenever the workflow requires human approval. Approval is explicit and auditable; rejection/cancellation stops the booking action.
-6. **Notification Agent** — sends booking/review/status notifications through configured providers and records delivery state.
+## System topology
 
-## Core workflow
+```text
+                         ┌──────────────────────┐
+                         │       Traveler       │
+                         └──────────┬───────────┘
+                                    │ request
+                                    ▼
+                         ┌──────────────────────┐
+                         │  Workflow Orchestrator│
+                         │ state + retries + TTL │
+                         └──────────┬───────────┘
+                                    │
+             ┌──────────────────────┼──────────────────────┐
+             ▼                      ▼                      ▼
+      ┌─────────────┐       ┌─────────────┐       ┌──────────────┐
+      │ Intake Agent│       │ Search Agent│       │ Policy Gate  │
+      └──────┬──────┘       └──────┬──────┘       └──────┬───────┘
+             │                      │                     │
+             └──────────────┬───────┴──────────────┬──────┘
+                            ▼                      │
+                    ┌──────────────┐              │
+                    │ Eval Agent   │──────────────┘
+                    │ rank/explain │       shortlist
+                    └──────┬───────┘
+                           ▼
+                    ┌──────────────┐
+                    │ Human Review │  explicit approval
+                    └──────┬───────┘
+                           │ approved
+                           ▼
+                    ┌──────────────┐
+                    │ Booking Agent│───► Supplier
+                    └──────┬───────┘
+                           ▼
+                    ┌──────────────┐
+                    │ Notification │
+                    └──────────────┘
+```
 
-`request -> intake -> live search -> evaluate -> shortlist -> human approval -> booking -> confirmation`
+The orchestrator owns workflow state. Agents are workers with narrow capabilities, not autonomous peers with unrestricted database or supplier access.
 
-Every transition is persisted. Agent retries must be idempotent. No agent may claim a booking exists until the supplier confirms it.
+## Agent contracts
 
-## Human-in-the-loop states
+### 1. Travel Intake Agent
 
-Use explicit states such as:
+**Input:** free-form traveler request.
 
-- `draft`
-- `searching`
-- `offers_ready`
-- `awaiting_human_approval`
-- `approved`
-- `rejected`
-- `booking`
-- `confirmed`
-- `failed`
-- `cancelled`
+**Output:** validated `TravelConstraints`:
 
-An approval record must contain the reviewer, decision, timestamp, selected offer, and optional comment. The booking worker must re-check approval state immediately before creating the supplier reservation.
+- destination / normalized location
+- check-in / check-out
+- guests / rooms
+- nightly and/or total budget
+- required amenities
+- cancellation requirements
+- accessibility or other explicit preferences
 
-## Data model
+It may ask for clarification. It must not silently invent missing constraints.
 
-Minimum persistent entities:
+### 2. Hotel Search Agent
 
-- users/profiles
-- trips
-- booking_requests
-- hotel_offers
-- approvals
-- bookings
-- agent_runs / workflow_events
-- notifications
+**Input:** immutable `TravelConstraints` + provider configuration.
 
-All user-owned records require row-level authorization. Provider credentials and server secrets never reach the browser.
+**Output:** normalized `HotelOffer[]` with provider hotel/offer IDs, room/rate, currency, price, taxes/fees when supplied, cancellation terms, and expiry.
 
-## Product rule
+Supplier calls are bounded by timeouts, concurrency limits, provider quotas, and request-scoped correlation IDs. Raw provider payloads are retained only when policy permits.
 
-Remove presentation-only hotel cards, fake counts, fake prices, and fake availability. If no supplier is configured, the product should show a clear configuration/error state rather than inventing an offer.
+### 3. Hotel Evaluation Agent
 
-## Provider boundary
+**Input:** normalized offers + immutable constraints.
 
-Create provider adapters so Amadeus or another hotel supplier can be replaced without changing the workflow. Supplier responses are normalized into the internal `hotel_offers` model. Booking uses the supplier's booking API/reference, not a local fake booking.
+**Output:** deterministic ranking features plus an optional natural-language explanation.
 
-## Approval UX
+The evaluator cannot create facts. Every user-visible factual claim must be traceable to the normalized offer or request. LLM output is treated as untrusted data and schema-validated before persistence.
 
-The traveler should see:
+### 4. Human Approval Gate
 
-- selected hotel and room/rate
-- total price and currency
-- taxes/fees when available
-- cancellation deadline/policy
-- supplier/provider
-- guest and stay details
-- approval status
-- approve / reject actions
+The orchestrator creates an approval record when a booking decision is ready. The gate displays the exact offer snapshot being authorized.
 
-After approval, the booking action should be visible as a separate workflow step with progress and final supplier confirmation.
+Approval is bound to:
+
+- `booking_request_id`
+- `offer_id`
+- offer price/currency snapshot
+- stay/guest snapshot
+- reviewer identity
+- decision timestamp
+- optional reviewer comment
+- workflow version / correlation ID
+
+If the offer expires or a material value changes, approval is invalidated and a fresh approval is required.
+
+### 5. Booking Agent
+
+The booking worker is the only component allowed to invoke the supplier booking capability.
+
+Immediately before the supplier call it must:
+
+1. reload the request and selected offer;
+2. verify the approval is still valid;
+3. verify the offer has not expired;
+4. revalidate price and material booking terms when the supplier supports it;
+5. acquire an idempotency key / booking lease;
+6. invoke the configured provider adapter;
+7. persist the supplier reference and confirmation only after a real supplier response.
+
+A timeout is **not** a confirmation. Unknown supplier state must enter reconciliation, not `confirmed`.
+
+### 6. Notification Agent
+
+Consumes durable workflow events and sends configured notifications. Notification failure must not roll back a confirmed supplier booking.
+
+## Orchestration model
+
+Use a durable state machine rather than an unconstrained agent-to-agent conversation:
+
+```text
+DRAFT
+  │
+  ▼
+INTAKE_VALIDATED ──invalid──► NEEDS_CLARIFICATION
+  │
+  ▼
+SEARCHING
+  │
+  ├── provider failure ──► DEGRADED / RETRYING
+  │
+  ▼
+OFFERS_READY
+  │
+  ▼
+EVALUATING
+  │
+  ▼
+AWAITING_HUMAN_APPROVAL
+  │          │
+ reject     approve
+  │          │
+  ▼          ▼
+REJECTED   APPROVED
+             │
+             ▼
+          REVALIDATING
+             │
+       ┌─────┴─────┐
+       ▼           ▼
+    BOOKING    REVALIDATION_FAILED
+       │
+       ├── confirmed ──► CONFIRMED
+       ├── provider error ► FAILED / RETRYABLE
+       └── unknown outcome ► RECONCILIATION
+```
+
+Every transition should be represented by a typed command/event and persisted to `workflow_events`. Workers must support at-least-once delivery safely through idempotency keys and conditional state transitions.
+
+### Orchestrator invariants
+
+- No transition skips the human approval boundary for a booking that requires approval.
+- `confirmed` means the supplier returned a verifiable booking reference.
+- A request can have at most one active approval gate.
+- A rejected/expired approval cannot authorize booking.
+- State transitions use compare-and-set semantics so stale workers cannot overwrite newer state.
+- Retries never duplicate supplier bookings.
+- Provider outages produce explicit degraded/error states rather than synthetic inventory.
+- Every external call has a timeout, bounded retry policy, and correlation ID.
+
+## Tool permissions
+
+Treat agent tools as capabilities with an allow-list. Example:
+
+| Agent | Read | Write | External side effects |
+|---|---|---|---|
+| Intake | request | normalized constraints | none |
+| Search | constraints, provider config | offers/events | hotel search |
+| Evaluation | constraints, offers | scores/events | none |
+| Approval | request, offer | approval/event | human decision only |
+| Booking | approved request, offer | booking/event | supplier booking |
+| Notification | workflow events | delivery state | email/notification |
+
+An agent must not receive broad database credentials. Server-side actions should expose narrow functions such as `searchHotels`, `createApprovalGate`, `approveOffer`, and `createSupplierBooking` rather than arbitrary SQL or HTTP access.
+
+## Security guardrails
+
+### Identity and authorization
+
+- Enforce Supabase RLS for every user-owned table.
+- Resolve the authenticated user on the server for every mutation; never trust a client-supplied `user_id`.
+- Check ownership again when loading a request, offer, approval, or booking.
+- Keep supplier/API credentials exclusively in server-side secret storage.
+- Never expose provider tokens, internal service credentials, raw authorization headers, or privileged RPCs to the browser.
+
+### Prompt-injection resistance
+
+Supplier descriptions, hotel names, reviews, user free text, and external content are **data, not instructions**. Never execute instructions found inside provider content.
+
+The evaluator should receive structured offer fields and a clearly delimited preference payload. Tool calls are generated from typed schemas, not arbitrary model-generated URLs or SQL.
+
+### Data minimization
+
+- Send the model only fields required for the current decision.
+- Keep guest PII out of search/evaluation prompts where possible.
+- Redact secrets and sensitive tokens from logs.
+- Define retention for raw supplier payloads and workflow traces.
+
+### Financial and booking controls
+
+- Enforce budget ceilings server-side.
+- Never let an LLM choose an arbitrary payment amount, currency, supplier endpoint, or recipient.
+- Re-check price, currency, cancellation terms, guest/stay details, and approval immediately before booking.
+- Require explicit approval for material price/term changes.
+- Use provider idempotency keys and a reconciliation path for uncertain outcomes.
+- Prevent duplicate booking attempts with database constraints/leases.
+
+### Abuse and reliability controls
+
+- Rate-limit request creation, provider searches, approval actions, and booking attempts.
+- Bound agent loops, tool calls, tokens, latency, and total workflow cost.
+- Apply circuit breakers for unhealthy providers.
+- Use exponential backoff with jitter for retryable provider failures.
+- Use dead-letter/reconciliation handling for permanently failed or ambiguous jobs.
+
+## Observability
+
+Every workflow should carry a `correlation_id`, `booking_request_id`, `agent_run_id`, and provider request ID when available.
+
+Capture structured events for:
+
+- state transitions
+- agent/tool invocation and latency
+- provider response class
+- retry count
+- approval decisions
+- booking idempotency key
+- supplier reference
+- notification delivery
+
+Do not log full payment credentials, access tokens, or unnecessary guest PII.
+
+Metrics worth operating:
+
+- search success / latency by provider
+- offer freshness and expiry rate
+- approval conversion and age
+- booking success / retry / reconciliation rate
+- duplicate-attempt prevention count
+- agent cost and token usage
+- provider error and circuit-breaker state
+
+## Failure semantics
+
+Prefer explicit uncertainty over optimistic state:
+
+- **Provider timeout:** `RETRYING` or `RECONCILIATION`, never `CONFIRMED`.
+- **Price changed:** invalidate approval and return to `AWAITING_HUMAN_APPROVAL`.
+- **Offer expired:** discard stale offer and search again.
+- **Duplicate delivery:** idempotency check returns the existing workflow result.
+- **LLM failure:** fall back to deterministic validation/ranking where possible; never invent missing supplier facts.
+- **Notification failure:** retry independently after booking confirmation.
+
+## Provider abstraction
+
+Use an adapter interface so orchestration is independent of Amadeus or another supplier:
+
+```ts
+interface HotelProvider {
+  search(input: HotelSearchInput): Promise<HotelSearchResult>;
+  getOffer(input: GetOfferInput): Promise<HotelOfferResult>;
+  createBooking?(input: CreateBookingInput): Promise<CreateBookingResult>;
+  reconcileBooking?(input: ReconcileBookingInput): Promise<BookingReconciliationResult>;
+}
+```
+
+The provider adapter owns supplier-specific authentication, schemas, error mapping, rate limits, and idempotency behavior. The orchestration layer consumes normalized domain types.
+
+## Implementation sequence
+
+1. **Orchestrator kernel:** typed state machine, transition guards, correlation IDs, idempotency primitives.
+2. **Search pipeline:** provider adapter → normalization → durable `hotel_offers` → expiry handling.
+3. **Evaluation:** deterministic scoring + optional structured LLM explanation.
+4. **Approval gate:** immutable offer snapshot + transactional approval transition.
+5. **Booking worker:** revalidation + supplier adapter + idempotent booking + reconciliation.
+6. **Notifications:** event-driven delivery with independent retries.
+7. **Operations:** metrics, traces, audit views, provider health, dead-letter/reconciliation tooling.
+
+The important architectural boundary is simple: **agents can reason and prepare actions; the orchestrator enforces policy; humans authorize consequential bookings; provider adapters execute only authorized side effects.**
