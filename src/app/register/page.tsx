@@ -1,6 +1,9 @@
 import Link from 'next/link';
 
-export default function RegisterPage() {
+export default async function RegisterPage({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
+  const params = await searchParams;
+  const error = params.error === 'registration_failed';
+
   return (
     <main className="page-shell">
       <div className="container auth-grid">
@@ -19,6 +22,7 @@ export default function RegisterPage() {
           <div className="brand"><span className="brand-mark">✈</span> VoyageAgent</div>
           <h1 style={{ marginTop: 28 }}>Create your account</h1>
           <p className="sub">Start building your next journey in a few seconds.</p>
+          {error && <p role="alert" className="error-message">We couldn’t create the account. The email may already be registered or the password may be invalid.</p>}
           <form action="/api/auth/register" method="post" className="form">
             <div className="field"><label htmlFor="name">Name</label><input id="name" name="name" required autoComplete="name" placeholder="Your name" /></div>
             <div className="field"><label htmlFor="email">Email</label><input id="email" name="email" type="email" required autoComplete="email" placeholder="you@example.com" /></div>
