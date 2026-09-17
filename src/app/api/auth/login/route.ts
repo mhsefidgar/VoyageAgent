@@ -1,19 +1,16 @@
+import { createClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 
 export async function POST(request: Request) {
   const form = await request.formData();
-  const email = String(form.get('email') ?? '').trim().toLowerCase();
+  const email = String(form.get('email') ?? '').trim();
   const password = String(form.get('password') ?? '');
+  const supabase = await createClient();
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
-  // Temporary local/demo authentication. Replace with Supabase Auth in production.
-  const destination = email === 'adminname' && password === 'adminpassword' ? '/admin' : '/dashboard';
-  const response = NextResponse.redirect(new URL(destination, request.url));
-  response.cookies.set('voyageagent_session', 'demo-authenticated', {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    path: '/',
-    maxAge: 60 * 60 * 24 * 7,
-  });
-  return response;
+  if (error || !data.user) {
+    return NextResponse.redirect(new URL('/login?error=invalid_credentials', request.url));
+  }
+
+  return NextResponse.redirect(new URL('/dashboard', request.url));
 }
