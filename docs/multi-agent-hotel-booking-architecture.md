@@ -1,136 +1,155 @@
-# VoyageAgent: Multi-Agent Hotel Booking Architecture
+# VoyageAgent: Industry-Standard Multi-Agent Hotel Booking Architecture
 
-VoyageAgent is a **stateful, multi-agent booking system with a human authorization boundary**. Agents can discover, normalize, rank, and explain inventory; only an approved workflow may cross the booking boundary.
+## 1. Architecture in one sentence
 
-The architecture deliberately separates **reasoning from authority**: an LLM can recommend an action, but it cannot grant itself permission to execute that action.
+VoyageAgent is a **modular monolith with durable workflow orchestration, event-driven agent workers, a relational domain model, and a human-in-the-loop authorization boundary**.
 
-## System topology
+This is deliberately different from a free-form agent swarm. Agents are specialized workers; the orchestrator is the authority for workflow state and policy.
+
+## 2. Why this architecture?
+
+Hotel booking is a **long-running, stateful business transaction** with money, changing inventory, external systems, retries, and irreversible side effects. That combination favors deterministic workflow control over an autonomous conversation.
+
+The architecture separates four concerns:
 
 ```text
-                         ┌──────────────────────┐
-                         │       Traveler       │
-                         └──────────┬───────────┘
-                                    │ request
-                                    ▼
-                         ┌──────────────────────┐
-                         │  Workflow Orchestrator│
-                         │ state + retries + TTL │
-                         └──────────┬───────────┘
-                                    │
-             ┌──────────────────────┼──────────────────────┐
-             ▼                      ▼                      ▼
-      ┌─────────────┐       ┌─────────────┐       ┌──────────────┐
-      │ Intake Agent│       │ Search Agent│       │ Policy Gate  │
-      └──────┬──────┘       └──────┬──────┘       └──────┬───────┘
-             │                      │                     │
-             └──────────────┬───────┴──────────────┬──────┘
-                            ▼                      │
-                    ┌──────────────┐              │
-                    │ Eval Agent   │──────────────┘
-                    │ rank/explain │       shortlist
-                    └──────┬───────┘
-                           ▼
-                    ┌──────────────┐
-                    │ Human Review │  explicit approval
-                    └──────┬───────┘
-                           │ approved
-                           ▼
-                    ┌──────────────┐
-                    │ Booking Agent│───► Supplier
-                    └──────┬───────┘
-                           ▼
-                    ┌──────────────┐
-                    │ Notification │
-                    └──────────────┘
+LLM reasoning       → interpretation, ranking, explanations
+Workflow authority  → state transitions, policy, retries, approval
+Domain persistence  → requests, offers, approvals, bookings, audit
+Provider side effect → search, revalidation, booking, reconciliation
 ```
 
-The orchestrator owns workflow state. Agents are workers with narrow capabilities, not autonomous peers with unrestricted database or supplier access.
+The result is easier to test, observe, secure, and evolve than a single agent with unrestricted tools.
 
-## Agent contracts
+## 3. Architectural style
 
-### 1. Travel Intake Agent
+### Modular monolith
 
-**Input:** free-form traveler request.
+The application is one deployable Next.js system, but its responsibilities are separated into domain modules and explicit interfaces.
 
-**Output:** validated `TravelConstraints`:
+**Why:** it keeps local transactions and development simple while preserving boundaries that can later become services.
 
-- destination / normalized location
-- check-in / check-out
-- guests / rooms
-- nightly and/or total budget
-- required amenities
-- cancellation requirements
-- accessibility or other explicit preferences
+### Durable workflow/state machine
 
-It may ask for clarification. It must not silently invent missing constraints.
+A booking request moves through explicit states instead of relying on conversational agent memory.
 
-### 2. Hotel Search Agent
+**Why:** workers can crash, messages can be duplicated, providers can timeout, and users can approve hours after a search. Durable state makes these conditions explicit.
 
-**Input:** immutable `TravelConstraints` + provider configuration.
+### Event-driven coordination
 
-**Output:** normalized `HotelOffer[]` with provider hotel/offer IDs, room/rate, currency, price, taxes/fees when supplied, cancellation terms, and expiry.
+Commands request work; events record facts.
 
-Supplier calls are bounded by timeouts, concurrency limits, provider quotas, and request-scoped correlation IDs. Raw provider payloads are retained only when policy permits.
+**Why:** downstream consumers such as notifications do not need to be coupled to the booking worker, and operational history remains auditable.
 
-### 3. Hotel Evaluation Agent
+### Human-in-the-loop control
 
-**Input:** normalized offers + immutable constraints.
+Human approval is a first-class state transition, not a UI decoration.
 
-**Output:** deterministic ranking features plus an optional natural-language explanation.
+**Why:** an LLM recommendation must never silently become a financial authorization.
 
-The evaluator cannot create facts. Every user-visible factual claim must be traceable to the normalized offer or request. LLM output is treated as untrusted data and schema-validated before persistence.
+### Ports-and-adapters provider boundary
 
-### 4. Human Approval Gate
+Supplier APIs are hidden behind normalized interfaces.
 
-The orchestrator creates an approval record when a booking decision is ready. The gate displays the exact offer snapshot being authorized.
+**Why:** the workflow should not depend on one supplier's authentication, response format, or error model.
 
-Approval is bound to:
+## 4. System topology
 
-- `booking_request_id`
-- `offer_id`
-- offer price/currency snapshot
-- stay/guest snapshot
-- reviewer identity
-- decision timestamp
-- optional reviewer comment
-- workflow version / correlation ID
+```text
+                          Traveler
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │    Next.js UI   │
+                    └────────┬────────┘
+                             │ authenticated command
+                             ▼
+                    ┌─────────────────┐
+                    │ API / Domain    │
+                    │ application     │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │   Orchestrator  │
+                    │ state + policy  │
+                    └───────┬─────────┘
+                            │ commands/events
+          ┌─────────────────┼───────────────────┐
+          ▼                 ▼                   ▼
+     Intake Agent      Search Agent        Evaluation Agent
+          │                 │                   │
+          └─────────────────┴───────────────────┘
+                            │
+                            ▼
+                    Human Approval Gate
+                            │
+                            ▼
+                      Booking Agent
+                            │
+                            ▼
+                    Provider Adapter
+                            │
+                            ▼
+                         Supplier
+                            │
+                            ▼
+                    Notification Agent
 
-If the offer expires or a material value changes, approval is invalidated and a fresh approval is required.
+                 ┌─────────────────────────┐
+                 │ Supabase/Postgres       │
+                 │ state + RLS + audit     │
+                 └─────────────────────────┘
+```
 
-### 5. Booking Agent
+## 5. End-to-end execution
 
-The booking worker is the only component allowed to invoke the supplier booking capability.
+### Step A — Traveler request
 
-Immediately before the supplier call it must:
+The user authenticates and creates a booking request. Server-side validation bounds dates, guests, rooms, budget, and preferences.
 
-1. reload the request and selected offer;
-2. verify the approval is still valid;
-3. verify the offer has not expired;
-4. revalidate price and material booking terms when the supplier supports it;
-5. acquire an idempotency key / booking lease;
-6. invoke the configured provider adapter;
-7. persist the supplier reference and confirmation only after a real supplier response.
+### Step B — Intake
 
-A timeout is **not** a confirmation. Unknown supplier state must enter reconciliation, not `confirmed`.
+The Intake Agent converts natural language into structured travel constraints. It may ask for missing information but cannot invent requirements.
 
-### 6. Notification Agent
+### Step C — Search
 
-Consumes durable workflow events and sends configured notifications. Notification failure must not roll back a confirmed supplier booking.
+The Search Agent calls a configured provider. Supplier responses are normalized into `hotel_offers`, preserving provider identifiers, pricing, cancellation data, and expiry.
 
-## Orchestration model
+### Step D — Evaluation
 
-Use a durable state machine rather than an unconstrained agent-to-agent conversation:
+The Evaluation Agent uses deterministic facts to calculate ranking features. An LLM can produce a concise explanation from those facts. The explanation is not authoritative data.
+
+### Step E — Approval
+
+The system creates an approval snapshot containing the selected offer and the commercial details the traveler is authorizing.
+
+### Step F — Revalidation
+
+Before booking, the current offer is loaded again. Price, currency, dates, guests, room/rate, cancellation terms, supplier, and expiry are checked. A material change requires new approval.
+
+### Step G — Booking
+
+The Booking Agent obtains an idempotency lease, calls the provider adapter, and persists the supplier result.
+
+### Step H — Confirmation
+
+Only a verifiable supplier booking reference can produce `confirmed`. Unknown supplier state enters reconciliation.
+
+### Step I — Notification
+
+Notification consumes durable workflow events independently. A notification failure cannot undo a confirmed supplier booking.
+
+## 6. State machine
 
 ```text
 DRAFT
   │
   ▼
-INTAKE_VALIDATED ──invalid──► NEEDS_CLARIFICATION
+INTAKE_VALIDATED ──► NEEDS_CLARIFICATION
   │
   ▼
-SEARCHING
-  │
-  ├── provider failure ──► DEGRADED / RETRYING
+SEARCHING ──► RETRYING / DEGRADED
   │
   ▼
 OFFERS_READY
@@ -140,133 +159,198 @@ EVALUATING
   │
   ▼
 AWAITING_HUMAN_APPROVAL
-  │          │
- reject     approve
-  │          │
-  ▼          ▼
-REJECTED   APPROVED
+       │          │
+    rejected   approved
+       │          │
+       ▼          ▼
+   REJECTED   REVALIDATING
+                   │
+             ┌─────┴─────┐
+             ▼           ▼
+          BOOKING   REVALIDATION_FAILED
              │
-             ▼
-          REVALIDATING
-             │
-       ┌─────┴─────┐
-       ▼           ▼
-    BOOKING    REVALIDATION_FAILED
-       │
-       ├── confirmed ──► CONFIRMED
-       ├── provider error ► FAILED / RETRYABLE
-       └── unknown outcome ► RECONCILIATION
+       ┌─────┼──────────┐
+       ▼     ▼          ▼
+ CONFIRMED FAILED RECONCILIATION_REQUIRED
 ```
 
-Every transition should be represented by a typed command/event and persisted to `workflow_events`. Workers must support at-least-once delivery safely through idempotency keys and conditional state transitions.
+The database and server-side workflow code are authoritative. The browser is a client, not a state machine.
 
-### Orchestrator invariants
+## 7. Agent contracts
 
-- No transition skips the human approval boundary for a booking that requires approval.
-- `confirmed` means the supplier returned a verifiable booking reference.
-- A request can have at most one active approval gate.
-- A rejected/expired approval cannot authorize booking.
-- State transitions use compare-and-set semantics so stale workers cannot overwrite newer state.
-- Retries never duplicate supplier bookings.
-- Provider outages produce explicit degraded/error states rather than synthetic inventory.
-- Every external call has a timeout, bounded retry policy, and correlation ID.
-
-## Tool permissions
-
-Treat agent tools as capabilities with an allow-list. Example:
-
-| Agent | Read | Write | External side effects |
+| Agent | Reads | Produces | Forbidden |
 |---|---|---|---|
-| Intake | request | normalized constraints | none |
-| Search | constraints, provider config | offers/events | hotel search |
-| Evaluation | constraints, offers | scores/events | none |
-| Approval | request, offer | approval/event | human decision only |
-| Booking | approved request, offer | booking/event | supplier booking |
-| Notification | workflow events | delivery state | email/notification |
+| Intake | traveler request | constraints | booking/financial side effects |
+| Search | constraints/provider config | normalized offers | arbitrary URLs/SQL |
+| Evaluation | constraints/offers | scores/explanation | inventing supplier facts |
+| Approval | request/offer snapshot | human decision | self-approval |
+| Booking | approved request/offer | booking result | bypassing approval |
+| Notification | workflow events | delivery result | changing booking state |
 
-An agent must not receive broad database credentials. Server-side actions should expose narrow functions such as `searchHotels`, `createApprovalGate`, `approveOffer`, and `createSupplierBooking` rather than arbitrary SQL or HTTP access.
+A useful engineering rule is: **the smaller the tool surface, the smaller the blast radius when a model or integration behaves incorrectly.**
 
-## Security guardrails
+## 8. Command/event model
 
-### Identity and authorization
+A command is an instruction:
 
-- Enforce Supabase RLS for every user-owned table.
-- Resolve the authenticated user on the server for every mutation; never trust a client-supplied `user_id`.
-- Check ownership again when loading a request, offer, approval, or booking.
-- Keep supplier/API credentials exclusively in server-side secret storage.
-- Never expose provider tokens, internal service credentials, raw authorization headers, or privileged RPCs to the browser.
+```text
+SearchHotels
+EvaluateOffers
+CreateApprovalGate
+ApproveOffer
+BookApprovedOffer
+ReconcileBooking
+```
 
-### Prompt-injection resistance
+An event is a fact:
 
-Supplier descriptions, hotel names, reviews, user free text, and external content are **data, not instructions**. Never execute instructions found inside provider content.
+```text
+HotelSearchStarted
+HotelOffersPersisted
+OffersEvaluated
+ApprovalRequested
+OfferApproved
+BookingStarted
+BookingConfirmed
+BookingReconciliationRequired
+```
 
-The evaluator should receive structured offer fields and a clearly delimited preference payload. Tool calls are generated from typed schemas, not arbitrary model-generated URLs or SQL.
+A worker must not assume a command runs exactly once. Design for at-least-once delivery.
+
+## 9. Reliability patterns
+
+### Idempotency
+
+Use different scopes for different side effects:
+
+```text
+workflow:{request}:{command}:{version}
+supplier-booking:{request}:{offer}:{approval}
+notification:{event}:{channel}
+```
+
+Repeated work returns the previous operation rather than repeating a supplier side effect.
+
+### Leases
+
+A short-lived booking lease prevents two workers from simultaneously booking the same approval.
+
+### Bounded retries
+
+Retry only errors known to be transient. Use exponential backoff and jitter. Never retry an unknown booking result blindly.
+
+### Circuit breakers
+
+If a supplier repeatedly fails, stop sending traffic temporarily and expose degraded status instead of generating fake availability.
+
+### Reconciliation
+
+If a supplier may have received the booking but the client timed out, query supplier status before any retry or confirmation.
+
+### Dead letters
+
+After a bounded retry budget, move poison work to a dead-letter path with safe diagnostics and correlation identifiers.
+
+## 10. AI trust boundary
+
+The model is a **reasoning component, not a security boundary**.
+
+```text
+untrusted text
+     ↓
+structured input
+     ↓
+LLM reasoning
+     ↓
+strict schema validation
+     ↓
+deterministic policy checks
+     ↓
+allowed command
+```
+
+The LLM cannot:
+
+- approve a booking;
+- set a final authoritative price;
+- mark a booking confirmed;
+- execute arbitrary SQL;
+- call arbitrary URLs;
+- access secrets;
+- bypass authorization.
+
+## 11. Prompt-injection defense
+
+External supplier content can contain text that looks like instructions. The system treats it as data.
+
+For example, a hotel description saying `ignore previous instructions` must remain a hotel description. It must never alter the tool policy.
+
+Use structured fields, explicit delimiters, strict output schemas, and capability allow-lists. Never allow model-generated supplier URLs or SQL to become executable commands without deterministic validation.
+
+## 12. Security model
+
+### Identity
+
+Authenticate every mutation. Resolve the user from the server session rather than a request body.
+
+### Authorization
+
+Use Supabase RLS plus server-side ownership checks. A user must not be able to reference another user's request, offer, approval, or booking by changing an ID.
+
+### Secrets
+
+Supplier and AI credentials remain server-side. They are never sent to the browser or model context.
 
 ### Data minimization
 
-- Send the model only fields required for the current decision.
-- Keep guest PII out of search/evaluation prompts where possible.
-- Redact secrets and sensitive tokens from logs.
-- Define retention for raw supplier payloads and workflow traces.
+Only send the minimum data required for an agent decision. Keep unnecessary guest PII out of prompts and logs.
 
-### Financial and booking controls
+### Abuse controls
 
-- Enforce budget ceilings server-side.
-- Never let an LLM choose an arbitrary payment amount, currency, supplier endpoint, or recipient.
-- Re-check price, currency, cancellation terms, guest/stay details, and approval immediately before booking.
-- Require explicit approval for material price/term changes.
-- Use provider idempotency keys and a reconciliation path for uncertain outcomes.
-- Prevent duplicate booking attempts with database constraints/leases.
+Rate-limit request creation, search, approval, and booking operations. Bound model tokens, tool calls, workflow duration, and total cost.
 
-### Abuse and reliability controls
+## 13. Financial safety
 
-- Rate-limit request creation, provider searches, approval actions, and booking attempts.
-- Bound agent loops, tool calls, tokens, latency, and total workflow cost.
-- Apply circuit breakers for unhealthy providers.
-- Use exponential backoff with jitter for retryable provider failures.
-- Use dead-letter/reconciliation handling for permanently failed or ambiguous jobs.
+The most important invariant is:
 
-## Observability
+```text
+LLM recommendation ≠ authorization
+UI click ≠ authorization by itself
+approval snapshot = authorization for specific terms
+supplier confirmation = booking confirmation
+```
 
-Every workflow should carry a `correlation_id`, `booking_request_id`, `agent_run_id`, and provider request ID when available.
+If material commercial terms change, the old approval no longer applies.
 
-Capture structured events for:
+## 14. Data architecture
 
-- state transitions
-- agent/tool invocation and latency
-- provider response class
-- retry count
-- approval decisions
-- booking idempotency key
-- supplier reference
-- notification delivery
+The relational model represents the business aggregate:
 
-Do not log full payment credentials, access tokens, or unnecessary guest PII.
+```text
+booking_request
+      │
+      ├── hotel_offer ──► provider reference
+      │
+      ├── approval ─────► exact authorized snapshot
+      │
+      ├── booking ──────► supplier reference
+      │
+      └── workflow_event ► audit/history
+```
 
-Metrics worth operating:
+Relational constraints are valuable here because correctness depends on relationships, uniqueness, ownership, and state transitions.
 
-- search success / latency by provider
-- offer freshness and expiry rate
-- approval conversion and age
-- booking success / retry / reconciliation rate
-- duplicate-attempt prevention count
-- agent cost and token usage
-- provider error and circuit-breaker state
+## 15. Observability
 
-## Failure semantics
+Propagate:
 
-Prefer explicit uncertainty over optimistic state:
+`correlation_id` · `booking_request_id` · `agent_run_id` · provider request ID · idempotency key
 
-- **Provider timeout:** `RETRYING` or `RECONCILIATION`, never `CONFIRMED`.
-- **Price changed:** invalidate approval and return to `AWAITING_HUMAN_APPROVAL`.
-- **Offer expired:** discard stale offer and search again.
-- **Duplicate delivery:** idempotency check returns the existing workflow result.
-- **LLM failure:** fall back to deterministic validation/ranking where possible; never invent missing supplier facts.
-- **Notification failure:** retry independently after booking confirmation.
+Track latency, retries, provider errors, offer freshness, approval age, booking outcomes, reconciliation volume, model usage, and workflow cost.
 
-## Provider abstraction
+Logs should contain safe structured metadata, not access tokens, payment credentials, or unnecessary PII.
 
-Use an adapter interface so orchestration is independent of Amadeus or another supplier:
+## 16. Provider abstraction
 
 ```ts
 interface HotelProvider {
@@ -277,16 +361,62 @@ interface HotelProvider {
 }
 ```
 
-The provider adapter owns supplier-specific authentication, schemas, error mapping, rate limits, and idempotency behavior. The orchestration layer consumes normalized domain types.
+The adapter owns supplier authentication, schemas, error translation, rate limits, and supplier-specific idempotency. The orchestrator works with normalized domain objects.
 
-## Implementation sequence
+## 17. Why not a microservice per agent?
 
-1. **Orchestrator kernel:** typed state machine, transition guards, correlation IDs, idempotency primitives.
-2. **Search pipeline:** provider adapter → normalization → durable `hotel_offers` → expiry handling.
-3. **Evaluation:** deterministic scoring + optional structured LLM explanation.
-4. **Approval gate:** immutable offer snapshot + transactional approval transition.
-5. **Booking worker:** revalidation + supplier adapter + idempotent booking + reconciliation.
-6. **Notifications:** event-driven delivery with independent retries.
-7. **Operations:** metrics, traces, audit views, provider health, dead-letter/reconciliation tooling.
+A service boundary should exist for an operational reason: independent scaling, deployment isolation, ownership, or failure containment.
 
-The important architectural boundary is simple: **agents can reason and prepare actions; the orchestrator enforces policy; humans authorize consequential bookings; provider adapters execute only authorized side effects.**
+If every agent becomes a service on day one, the team inherits distributed tracing, network failures, deployment coordination, schema versioning, and distributed transactions before those costs are justified.
+
+The current modular boundaries preserve an easy future migration:
+
+```text
+Today:
+Next.js + modules + durable DB
+
+Later, where justified:
+Next.js → queue → Search Worker
+                  → Evaluation Worker
+                  → Booking Worker
+                  → Notification Worker
+```
+
+The contracts stay stable while the deployment topology evolves.
+
+## 18. Why not a pure autonomous swarm?
+
+A swarm can be useful for open-ended research, but booking needs explicit authority.
+
+If Agent A can ask Agent B to book and Agent B can ask Agent C to approve, it becomes difficult to answer basic production questions: who authorized the charge, which offer was approved, what happened after a retry, and which component owns the state?
+
+VoyageAgent instead makes authority explicit and auditable.
+
+## 19. Production engineering checklist
+
+- [ ] Every state transition has a server-side guard.
+- [ ] Every side effect has an idempotency strategy.
+- [ ] Every supplier call has timeout and retry semantics.
+- [ ] Ambiguous supplier results reconcile before confirmation.
+- [ ] Approval is bound to an immutable commercial snapshot.
+- [ ] RLS and ownership checks are tested.
+- [ ] Model output is schema-validated.
+- [ ] External text is treated as untrusted data.
+- [ ] Secrets are absent from browser payloads, prompts, and logs.
+- [ ] Provider sandbox/contract tests exist before production booking.
+- [ ] Metrics, traces, alerts, and dead-letter handling exist before scale.
+
+## 20. Implementation map
+
+The repository maps the architecture to these areas:
+
+```text
+src/app/                         → UI + server routes
+src/lib/booking/workflow.ts     → workflow invariants
+src/app/api/hotels/search       → provider search boundary
+supabase/migrations/             → state, RLS, integrity
+.github/workflows/               → CI verification
+docs/                            → architecture + operations
+```
+
+The design target is not “maximum agent autonomy.” It is **controlled autonomy**: enough intelligence to reduce manual travel work, with deterministic boundaries wherever correctness, security, money, or external side effects matter.
