@@ -1,57 +1,52 @@
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
+import { createClient } from '@/lib/supabase/server';
 
-const hotels = [
-  { name: 'Hotel Bonaventure Montreal', location: 'Montréal, QC', detail: 'Central stay · Rooftop pool', price: '$189 / night' },
-  { name: 'Fairmont Vancouver', location: 'Vancouver, BC', detail: 'Downtown · Mountain views', price: '$229 / night' },
-  { name: 'The Drake Hotel', location: 'Toronto, ON', detail: 'Queen West · Boutique stay', price: '$205 / night' },
-];
+export default async function DashboardPage() {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect('/login');
 
-export default function DashboardPage() {
+  const [{ data: requests }, { count: savedCount }, { data: bookings }] = await Promise.all([
+    supabase.from('booking_requests').select('id, destination, check_in, check_out, status, guests, rooms, updated_at').eq('user_id', user.id).order('updated_at', { ascending: false }).limit(10),
+    supabase.from('saved_hotels').select('*', { count: 'exact', head: true }).eq('user_id', user.id),
+    supabase.from('bookings').select('id, status, provider_booking_id, created_at').eq('user_id', user.id).order('created_at', { ascending: false }).limit(5),
+  ]);
+
+  const active = (requests ?? []).filter((item) => !['confirmed', 'cancelled', 'rejected', 'failed'].includes(item.status)).length;
+  const awaiting = (requests ?? []).filter((item) => item.status === 'awaiting_human_approval').length;
+  const confirmed = (bookings ?? []).filter((item) => item.status === 'confirmed').length;
+
   return (
     <main className="page-shell">
       <div className="container">
         <nav className="dashboard-nav">
           <Link className="brand" href="/"><span className="brand-mark">✈</span> VoyageAgent</Link>
-          <div className="actions">
-            <Link className="pill" href="/">Home</Link>
-            <form action="/api/auth/logout" method="post">
-              <button className="pill" type="submit">Sign out</button>
-            </form>
-          </div>
+          <div className="actions"><Link className="pill" href="/">Home</Link><form action="/api/auth/logout" method="post"><button className="pill" type="submit">Sign out</button></form></div>
         </nav>
 
         <section className="dashboard-hero">
-          <div><div className="eyebrow">Traveler workspace</div><h1>Welcome back</h1><p>Everything you need for your next journey, in one place.</p></div>
-          <Link className="button" href="#trips">＋ Plan a new trip</Link>
+          <div><div className="eyebrow">Traveler workspace</div><h1>Your booking operations.</h1><p>Agents search and evaluate live hotel offers. You make the final booking decision.</p></div>
+          <Link className="button" href="/dashboard/requests/new">＋ New hotel request</Link>
         </section>
 
         <section className="stats">
-          <div className="card stat"><span className="muted">Active trips</span><div className="value">2</div></div>
-          <div className="card stat"><span className="muted">Saved places</span><div className="value">12</div></div>
-          <div className="card stat"><span className="muted">Hotel options</span><div className="value">8</div></div>
-          <div className="card stat"><span className="muted">AI plans</span><div className="value">4</div></div>
+          <div className="card stat"><span className="muted">Active requests</span><div className="value">{active}</div></div>
+          <div className="card stat"><span className="muted">Awaiting approval</span><div className="value">{awaiting}</div></div>
+          <div className="card stat"><span className="muted">Confirmed bookings</span><div className="value">{confirmed}</div></div>
+          <div className="card stat"><span className="muted">Saved hotels</span><div className="value">{savedCount ?? 0}</div></div>
         </section>
 
-        <div className="section-title" id="trips"><h2>Quick actions</h2><span>Start where you left off</span></div>
-        <section className="feature-grid">
-          <Link className="card feature" href="#trips"><div className="icon">🧳</div><h3>My Trips</h3><p>Create, edit, and organize itineraries with dates, destinations, and travel notes.</p><span className="text-link">Open trips →</span></Link>
-          <Link className="card feature" href="#hotels"><div className="icon">🏨</div><h3>Hotels & stays</h3><p>Browse hotel options, compare stay details, and keep promising properties saved.</p><span className="text-link">Explore stays →</span></Link>
-          <Link className="card feature" href="#planner"><div className="icon">✨</div><h3>AI Planner</h3><p>Turn your destination, budget, and preferences into a practical travel plan.</p><span className="text-link">Start planning →</span></Link>
+        <div className="section-title"><h2>Booking requests</h2><span>Persistent workflow state</span></div>
+        <section className="offer-list">
+          {(requests ?? []).map((request) => <Link className="card trip-card" href={`/dashboard/requests/${request.id}`} key={request.id}>
+            <div><div className="eyebrow">{request.status.replaceAll('_', ' ')}</div><h3>{request.destination}</h3><p>{request.check_in} → {request.check_out} · {request.guests} guests · {request.rooms} room{request.rooms === 1 ? '' : 's'}</p></div>
+            <span className="text-link">Open workflow →</span>
+          </Link>)}
+          {!requests?.length && <div className="card empty-state"><h3>No booking requests yet</h3><p>Start with a destination, dates, guests, and the preferences that matter to you.</p><Link className="button" href="/dashboard/requests/new">Create first request</Link></div>}
         </section>
 
-        <div className="section-title" id="hotels"><h2>Hotel suggestions</h2><span>Curated for your workspace</span></div>
-        <section style={{ display: 'grid', gap: 12 }}>
-          {hotels.map((hotel) => <article className="card trip-card" key={hotel.name}>
-            <div><div className="eyebrow">Recommended stay</div><h3>{hotel.name}</h3><p>{hotel.location} · {hotel.detail}</p></div>
-            <div><strong>{hotel.price}</strong><p>Flexible dates available</p></div>
-            <button className="pill" type="button">View stay</button>
-          </article>)}
-        </section>
-
-        <section className="card planner-banner" id="planner">
-          <div><div className="eyebrow">AI travel planning</div><h2>Build your next trip in minutes.</h2><p>Tell VoyageAgent where you want to go and what matters to you. Your planning workspace can grow from there.</p></div>
-          <Link className="button" href="#trips">Start planning</Link>
-        </section>
+        <section className="card planner-banner"><div><div className="eyebrow">Human-in-the-loop booking</div><h2>No reservation happens without you.</h2><p>VoyageAgent persists the agent workflow, shows the selected hotel and rate, and requires explicit approval immediately before the booking agent can act.</p></div><Link className="button" href="/dashboard/requests/new">Start a request</Link></section>
       </div>
     </main>
   );
